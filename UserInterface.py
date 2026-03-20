@@ -1,131 +1,734 @@
+# ============================================================
 # UserInterface.py
-#
-# ============================================================
-# Policy Intent Compliance Assistant (Gradio UI)
+# Policy / Intent Compliance Assistant - Gradio UI Layer
 # ============================================================
 #
-# PROJECT CONTEXT (big picture)
-# -----------------------------
-# This semester project builds a "Compliance Assistant" for network devices:
+# PURPOSE
+# -------
+# This file provides the user-facing web interface for the semester
+# project. It is responsible for collecting inputs, calling the
+# backend pipeline, and returning the final compliance report to
+# the user in a simple local web app.
 #
-#   Inputs:
-#     1) A policy/intent document (PDF) — e.g., CIS Benchmarks / NIST guidance
-#     2) A device configuration file (TXT/CFG) — e.g., Cisco IOS running-config
+# This file does NOT make the final compliance decision itself.
+# Its role is orchestration and presentation.
 #
-#   Goal:
-#     - Extract testable compliance rules from the policy PDF using an AI model.
-#     - Run deterministic, explainable checks against the config text.
-#       (IMPORTANT: The AI does NOT decide PASS/FAIL. It only produces structured rules.)
-#     - Produce a report with PASS/FAIL/NEEDS_REVIEW per rule, including exact evidence lines.
+# ARCHITECTURE ROLE
+# -----------------
+# This file is the UI/orchestrator layer only:
 #
-# TEAM DIVISION (how this file fits)
-# ---------------------------------
-#  - You (this file): Build the web UI in Gradio
-#       * upload PDF + config
-#       * let the user set options
-#       * trigger the pipeline
-#       * display results + provide downloadable artifacts
+#   User uploads:
+#     1) Policy / intent PDF
+#     2) Device configuration TXT / CFG
 #
-#  - Backend teammate: Deterministic parsing + checks + report generator
-#       * parse config file format (Cisco IOS / NX-OS / JunOS / etc.)
-#       * run checks (regex / CiscoConfParse / TextFSM / etc.)
-#       * generate report artifacts (HTML/MD) + JSON results
+#   Then this file:
+#     - validates the inputs
+#     - extracts text from the PDF
+#     - calls the TAMU AI Chat API to extract candidate rules
+#     - parses the AI output JSON
+#     - sends the raw extracted rules into normalize.py
+#     - sends the normalized rules and config text into checks_ios.py
+#     - generates the final HTML report
+#     - returns that report to Gradio for download/viewing
 #
-#  - AI teammate: Policy-to-rules extraction layer
-#       * read policy text (PDF extraction)
-#       * call LLM to produce structured rules (schema-validated JSON)
+# HIGH-LEVEL FLOW
+# ---------------
+# 1) User launches the Gradio app locally.
+# 2) User uploads a policy PDF and a config file.
+# 3) User selects vendor mode and strictness mode.
+# 4) User clicks "Run Compliance Check".
+# 5) Gradio calls the submit() function in this file.
+# 6) submit() runs the end-to-end pipeline:
 #
-# HOW THE UI WORKS (runtime flow)
-# ------------------------------
-# 1) User opens the local Gradio webpage (served by this Python process).
-# 2) User uploads policy PDF + config TXT and selects settings.
-# 3) User clicks "Run Compliance Check".
-# 4) Gradio calls a Python callback function (submit()) with file paths + settings.
-# 5) In the final version, submit() will call the orchestrator pipeline:
+#       PDF -> extracted text
+#       extracted text -> TAMU AI rule extraction
+#       AI rule JSON -> normalize_rules(...)
+#       normalized rules + config -> evaluate_all_rules(...)
+#       evaluation results -> build_html_report(...)
 #
-#        rules = ai.extract_rules_from_pdf(pdf_path)
-#        cfg   = backend.parse_config(cfg_path, vendor=...)
-#        res   = backend.run_checks(cfg, rules, strictness=...)
-#        report_paths = backend.build_report(res)
-#        return report preview + downloadable artifacts
+# 7) The final HTML report is saved to the run folder and returned
+#    as a downloadable artifact in the UI.
 #
-# For now, this UI includes a stub submit() to prove the wiring and downloads work.
-#
-# EXIT BUTTON BEHAVIOR
+# WHY THIS FILE EXISTS
 # --------------------
-# This app runs as a local server process. The user typically stops it with Ctrl+C
-# in the terminal. To make it easier for non-technical users, we provide an "Exit"
-# button that shows a shutdown screen and then terminates the server process.
+# The semester project needs a simple, demo-friendly interface.
+# Gradio is used because it allows a lightweight Python-only web app
+# without requiring a separate frontend framework.
 #
+# This file makes the system usable by:
+#   - instructors
+#   - classmates
+#   - project reviewers
+# who may not want to run backend scripts manually.
+#
+# IMPORTANT DESIGN RULE
+# ---------------------
+# AI is NOT the final compliance judge.
+#
+# The AI is only used to read the benchmark/policy PDF and extract
+# structured candidate rules in JSON form.
+#
+# The actual PASS / FAIL / NEEDS_HUMAN_REVIEW decision is made later
+# by deterministic Python logic in checks_ios.py.
+#
+# That separation is one of the most important design principles
+# in this project.
+#
+# TYPICAL INPUTS
+# --------------
+# - PDF:
+#     CIS benchmark, NIST guidance, or similar policy/intent document
+#
+# - Config file:
+#     Cisco IOS running-config text file (.txt / .cfg)
+#
+# - Vendor mode:
+#     For the current MVP, the real supported path is Cisco IOS
+#
+# - Strictness:
+#     Controls how ambiguous cases are scored
+#       strict   -> FAIL
+#       balanced -> NEEDS_HUMAN_REVIEW
+#       lenient  -> PASS
+#
+# TYPICAL OUTPUTS
+# ---------------
+# - raw extracted rules JSON
+# - normalized deterministic rules JSON
+# - evaluation results JSON
+# - final HTML compliance report
+#
+# RUN FOLDER CONTENTS
+# -------------------
+# Each execution can create a timestamped run folder containing:
+#   - copied input files
+#   - extracted PDF text
+#   - raw LLM-extracted rules
+#   - normalized rules
+#   - evaluation results
+#   - final HTML report
+#   - optional debug/error files if something fails
+#
+# WHY DEBUG SAVING IS IMPORTANT
+# -----------------------------
+# This project has multiple stages:
+#   PDF extraction
+#   AI extraction
+#   normalization
+#   deterministic checking
+#   report generation
+#
+# Saving intermediate artifacts makes it much easier to:
+#   - debug failures
+#   - inspect what the AI extracted
+#   - show project progress
+#   - explain the architecture during demos
+#
+# TAMU AI API ROLE
+# ----------------
+# This file communicates with the TAMU AI Chat API using:
+#   - Bearer token authentication
+#   - configured base URL from .env
+#   - the protected.gpt-4.1 model
+#
+# The prompt asks the model to return structured JSON containing
+# candidate compliance rules with fields such as:
+#   - rule_id
+#   - title
+#   - requirement_text
+#   - source_page
+#   - source_section
+#   - source_excerpt
+#   - scope_hint
+#   - check_type
+#   - required_patterns
+#   - forbidden_patterns
+#   - needs_human_review
+#
+# The UI/orchestrator then passes that raw JSON into normalize.py.
+#
+# ERROR HANDLING
+# --------------
+# This file should be defensive because several things can fail:
+#   - invalid uploads
+#   - unreadable PDF
+#   - bad API key or endpoint
+#   - model returns malformed JSON
+#   - normalization failure
+#   - deterministic checker failure
+#
+# For that reason, this file should catch exceptions and write
+# useful debug files to the run folder instead of only crashing.
+#
+# SUMMARY
+# -------
+# UserInterface.py is the entry point of the project.
+# It connects the three major layers:
+#
+#   Gradio UI  ->  AI extraction  ->  deterministic checker
+#
+# It is not the policy engine and not the compliance judge.
+# It is the pipeline coordinator and demo interface.
 # ============================================================
-
+import json
 import os
+import shutil
 import threading
+import webbrowser
 from datetime import datetime
+from pathlib import Path
+
 import gradio as gr
+import requests
+from pypdf import PdfReader
+
+from normalize import normalize_rules
+from checks_ios import evaluate_all_rules, build_html_report
+
+
+SUPPORTED_VENDOR = "Cisco IOS"
+DEFAULT_MODEL = "protected.gpt-4.1"
+RUNS_DIR = Path("runs")
 
 
 # ------------------------------------------------------------
-# submit() is the UI's "Run" callback.
-#
-# Today: stub behavior (no real AI or backend integration)
-# Final: will call your pipeline module and return real artifacts
+# Environment / file helpers
+# ------------------------------------------------------------
+def load_local_env(env_path: str = ".env"):
+    """
+    Lightweight .env loader so this file does not depend on python-dotenv.
+    Existing environment variables are not overwritten.
+    """
+    path = Path(env_path)
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def read_text_file(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def extract_pdf_pages(pdf_path: str):
+    """
+    Returns a list of dicts:
+      [{"page_number": 1, "text": "..."}, ...]
+    """
+    reader = PdfReader(pdf_path)
+    pages = []
+
+    for i, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            pages.append({
+                "page_number": i,
+                "text": text
+            })
+
+    return pages
+
+
+def build_pdf_chunks(pages, max_chars: int = 12000):
+    """
+    Groups extracted PDF pages into moderately sized LLM chunks.
+    """
+    chunks = []
+    current_pages = []
+    current_text_parts = []
+    current_len = 0
+
+    for page in pages:
+        block = f"\n\n--- PAGE {page['page_number']} ---\n{page['text']}"
+        if current_pages and current_len + len(block) > max_chars:
+            chunks.append({
+                "start_page": current_pages[0],
+                "end_page": current_pages[-1],
+                "text": "".join(current_text_parts).strip()
+            })
+            current_pages = []
+            current_text_parts = []
+            current_len = 0
+
+        current_pages.append(page["page_number"])
+        current_text_parts.append(block)
+        current_len += len(block)
+
+    if current_pages:
+        chunks.append({
+            "start_page": current_pages[0],
+            "end_page": current_pages[-1],
+            "text": "".join(current_text_parts).strip()
+        })
+
+    return chunks
+
+
+def strip_code_fences(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+    return text
+
+
+def parse_json_from_model_text(text: str):
+    cleaned = strip_code_fences(text)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(cleaned[start:end + 1])
+
+    raise ValueError("Model response did not contain valid JSON.")
+
+
+def dedupe_rules(rules):
+    out = []
+    seen = set()
+
+    for rule in rules:
+        key = (
+            str(rule.get("title", "")).strip().lower(),
+            str(rule.get("requirement_text", "")).strip().lower(),
+            tuple(x.strip().lower() for x in rule.get("required_patterns", []) if str(x).strip()),
+            tuple(x.strip().lower() for x in rule.get("forbidden_patterns", []) if str(x).strip()),
+            str(rule.get("scope_hint", "")).strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rule)
+
+    return out
+
+
+# ------------------------------------------------------------
+# TAMU AI extraction helpers
+# ------------------------------------------------------------
+def _preview_text(value, max_len: int = 500):
+    text = str(value or "")
+    text = text.replace(chr(13), " ").replace(chr(10), "\n")
+    return text[:max_len]
+
+
+def _extract_content_from_chat_response(data):
+    if not isinstance(data, dict):
+        raise RuntimeError(f"TAMU response root was not a JSON object: {type(data).__name__}")
+
+    if isinstance(data.get("_assistant_text"), str) and data.get("_assistant_text").strip():
+        return data["_assistant_text"]
+
+    if data.get("error"):
+        raise RuntimeError(f"TAMU API error payload: {data['error']}")
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"TAMU JSON did not contain choices[]. Keys: {list(data.keys())[:20]}")
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        joined = "".join(text_parts).strip()
+        if joined:
+            return joined
+
+    if isinstance(data.get("output_text"), str) and data.get("output_text").strip():
+        return data["output_text"]
+
+    raise RuntimeError(
+        "TAMU JSON response was valid, but no assistant text content was found. "
+        f"Top-level keys: {list(data.keys())[:20]}"
+    )
+
+
+def _extract_text_from_sse_body(body_text: str) -> str:
+    """
+    Parse text/event-stream chat chunk output and reconstruct assistant text
+    from choices[*].delta.content fragments.
+    """
+    text_parts = []
+    event_count = 0
+
+    for raw_line in body_text.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+
+        event_count += 1
+
+        try:
+            event = json.loads(payload)
+        except Exception:
+            continue
+
+        if isinstance(event, dict) and event.get("error"):
+            raise RuntimeError(f"TAMU SSE error payload: {event['error']}")
+
+        choices = event.get("choices", [])
+        if not isinstance(choices, list):
+            continue
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            delta = choice.get("delta", {})
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    text_parts.append(content)
+
+            message = choice.get("message", {})
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    text_parts.append(content)
+
+            content = choice.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+
+    joined = "".join(text_parts).strip()
+    if joined:
+        return joined
+
+    raise RuntimeError(
+        "TAMU returned text/event-stream, but no assistant content could be reconstructed. "
+        f"Body preview: {_preview_text(body_text)} | Parsed events: {event_count}"
+    )
+
+
+def _post_tamu_chat(url: str, headers: dict, payload: dict):
+    response = requests.post(url, headers=headers, json=payload, timeout=180)
+    content_type = response.headers.get("content-type", "")
+    body_text = response.text or ""
+
+    if not response.ok:
+        raise RuntimeError(
+            f"TAMU HTTP error {response.status_code}. "
+            f"Content-Type: {content_type or 'unknown'}. "
+            f"Body preview: {_preview_text(body_text)}"
+        )
+
+    if not body_text.strip():
+        raise RuntimeError(f"TAMU returned an empty HTTP body with status {response.status_code}.")
+
+    lowered_type = content_type.lower()
+
+    if "text/event-stream" in lowered_type or body_text.lstrip().startswith("data:"):
+        return {
+            "_transport": "sse",
+            "_assistant_text": _extract_text_from_sse_body(body_text),
+        }
+
+    try:
+        return response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            "TAMU returned a non-JSON HTTP body. "
+            f"Content-Type: {content_type or 'unknown'}. "
+            f"Body preview: {_preview_text(body_text)}"
+        ) from exc
+
+
+def call_tamu_chat(messages, model: str = DEFAULT_MODEL):
+    load_local_env()
+
+    api_key = os.getenv("TAMU_AI_API_KEY")
+    base_url = (os.getenv("TAMU_AI_BASE_URL") or "https://chat-api.tamu.ai").rstrip("/")
+    url = f"{base_url}/openai/chat/completions"
+
+    if not api_key:
+        raise RuntimeError("TAMU_AI_API_KEY is missing. Add it to your .env file.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": messages,
+    }
+
+    try:
+        data = _post_tamu_chat(url, headers, payload)
+        return _extract_content_from_chat_response(data)
+    except Exception as first_exc:
+        fallback_payload = {
+            "model": model,
+            "temperature": 0,
+            "messages": messages,
+        }
+        try:
+            data = _post_tamu_chat(url, headers, fallback_payload)
+            return _extract_content_from_chat_response(data)
+        except Exception as second_exc:
+            raise RuntimeError(
+                "TAMU chat call failed in both modes. "
+                f"First attempt error: {first_exc} | Fallback attempt error: {second_exc}"
+            ) from second_exc
+
+def make_extraction_messages(document_name: str, chunk_text: str, chunk_index: int, total_chunks: int):
+    system_prompt = (
+        "You extract deterministic Cisco IOS compliance rules from policy text. "
+        "Return ONLY valid JSON. Do not include markdown or commentary. "
+        "Only include rules grounded in the provided text. Do not invent commands. "
+        "This JSON will be normalized and then checked by deterministic Python logic; "
+        "the model is not the final compliance judge."
+    )
+
+    user_prompt = f"""
+Extract candidate compliance rules from this Cisco IOS policy chunk.
+
+Document name: {document_name}
+Chunk: {chunk_index} of {total_chunks}
+
+Return exactly this JSON shape:
+{{
+  "rules": [
+    {{
+      "rule_id": "string",
+      "title": "string",
+      "requirement_text": "string",
+      "source_page": 1,
+      "source_section": "string",
+      "source_excerpt": "string",
+      "scope_hint": "global|line_vty|line_console|line_aux|unknown or pipe-delimited multi-scope",
+      "check_type": "required|forbidden|required_and_forbidden|manual_review",
+      "required_patterns": ["exact Cisco IOS command or regex-like pattern"],
+      "forbidden_patterns": ["exact Cisco IOS command or regex-like pattern"],
+      "needs_human_review": false,
+      "vendor_scope": ["Cisco IOS"]
+    }}
+  ]
+}}
+
+Rules:
+- Focus only on Cisco IOS-style checks that are realistically automatable for this MVP.
+- If a requirement is ambiguous or not safely machine-checkable, set needs_human_review=true.
+- Prefer exact IOS commands when the text clearly supports them.
+- Use required_patterns for commands that must be present.
+- Use forbidden_patterns for commands or states that must not be present.
+- If the rule is purely manual/ambiguous, use check_type="manual_review" and leave pattern lists empty.
+- source_page must be the actual page number shown in the provided chunk markers.
+- source_excerpt must be short and grounded in the text.
+- Do not duplicate near-identical rules inside one chunk.
+
+Policy text chunk:
+{chunk_text}
+""".strip()
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def extract_rules_from_pdf_with_tamu(pdf_path: str, model: str = DEFAULT_MODEL):
+    pages = extract_pdf_pages(pdf_path)
+    if not pages:
+        raise ValueError("No readable text was extracted from the PDF.")
+
+    chunks = build_pdf_chunks(pages, max_chars=12000)
+    all_rules = []
+    raw_chunk_outputs = []
+    document_name = Path(pdf_path).name
+
+    for idx, chunk in enumerate(chunks, start=1):
+        messages = make_extraction_messages(
+            document_name=document_name,
+            chunk_text=chunk["text"],
+            chunk_index=idx,
+            total_chunks=len(chunks),
+        )
+        content = call_tamu_chat(messages, model=model)
+        parsed = parse_json_from_model_text(content)
+
+        chunk_rules = parsed.get("rules", [])
+        if not isinstance(chunk_rules, list):
+            raise ValueError(f"Chunk {idx} returned invalid JSON: 'rules' must be a list.")
+
+        raw_chunk_outputs.append({
+            "chunk_index": idx,
+            "page_range": [chunk["start_page"], chunk["end_page"]],
+            "model_output": parsed,
+        })
+        all_rules.extend(chunk_rules)
+
+    deduped_rules = dedupe_rules(all_rules)
+
+    extracted_doc = {
+        "document_name": document_name,
+        "rules": deduped_rules,
+    }
+
+    return extracted_doc, raw_chunk_outputs, pages, chunks
+
+
+# ------------------------------------------------------------
+# submit() is the UI's real orchestration callback.
 # ------------------------------------------------------------
 def submit(intent_pdf_path: str, config_txt_path: str, vendor: str, strictness: str):
-    """
-    This function is invoked when the user clicks 'Run Compliance Check'.
-
-    Inputs come from Gradio components:
-      - intent_pdf_path: local temp path to uploaded PDF
-      - config_txt_path: local temp path to uploaded config file
-      - vendor: dropdown selection (used by backend parser/checkers)
-      - strictness: scoring preference for ambiguous/missing items
-
-    Outputs returned to Gradio:
-      - status markdown to display in the Outputs panel
-      - a downloadable file (stub now; report artifact later)
-    """
-
-    # Basic validation: don't run the pipeline without both required files
     if not intent_pdf_path or not config_txt_path:
         return (
             "❌ Please upload **both** the Policy/Intent PDF and the Config TXT before submitting.",
             gr.update(visible=False, value=None),
         )
 
-    # In a real pipeline, these file paths get passed to downstream modules
-    pdf_name = os.path.basename(intent_pdf_path)
-    cfg_name = os.path.basename(config_txt_path)
+    if vendor != SUPPORTED_VENDOR:
+        return (
+            "❌ This MVP is currently wired only for **Cisco IOS** inputs. "
+            "Please select **Cisco IOS** and upload a Cisco IOS-style benchmark PDF and running-config file.",
+            gr.update(visible=False, value=None),
+        )
 
-    # This is what you'll display after the pipeline runs.
-    # Later, you will replace this with:
-    #   - pass/fail counts
-    #   - severity breakdown
-    #   - links to real report artifacts (HTML/JSON)
-    md = f"""
-### ✅ Run created
+    try:
+        now = datetime.now()
+        run_stamp = now.strftime("%Y%m%d_%H%M%S")
+        run_dir = RUNS_DIR / f"run_{run_stamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        pdf_name = os.path.basename(intent_pdf_path)
+        cfg_name = os.path.basename(config_txt_path)
+
+        shutil.copy2(intent_pdf_path, run_dir / pdf_name)
+        shutil.copy2(config_txt_path, run_dir / cfg_name)
+
+        extracted_doc, chunk_outputs, pages, chunks = extract_rules_from_pdf_with_tamu(intent_pdf_path)
+        config_text = read_text_file(config_txt_path)
+        normalized_doc = normalize_rules(extracted_doc)
+        report = evaluate_all_rules(normalized_doc, config_text, strictness=strictness)
+        html_report = build_html_report(report, config_name=cfg_name)
+
+        (run_dir / "policy_text.txt").write_text(
+            "\n\n".join(
+                f"--- PAGE {p['page_number']} ---\n{p['text']}" for p in pages
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "chunk_debug.json").write_text(
+            json.dumps({
+                "document_name": extracted_doc["document_name"],
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "extracted_rules_raw.json").write_text(
+            json.dumps(extracted_doc, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "extraction_chunk_outputs.json").write_text(
+            json.dumps(chunk_outputs, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "normalized_rules.json").write_text(
+            json.dumps(normalized_doc, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "check_results.json").write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+
+        html_path = run_dir / "check_report.html"
+        html_path.write_text(html_report, encoding="utf-8")
+
+        try:
+            webbrowser.open(html_path.resolve().as_uri())
+        except Exception:
+            pass
+
+        norm_summary = normalized_doc.get("normalization_summary", {})
+        md = f"""
+### ✅ Compliance run complete
 
 - **Policy / Intent (PDF):** `{pdf_name}`
 - **Device Config (TXT/CFG):** `{cfg_name}`
 - **Vendor Mode:** `{vendor}`
 - **Strictness:** `{strictness}`
+- **Run folder:** `{run_dir}`
 
-**Next (when backend is connected):**
-1. Extract structured rules from policy (LLM)
-2. Run deterministic checks on config
-3. Generate PASS/FAIL/REVIEW report with evidence
+### Extraction summary
+- **PDF pages with readable text:** `{len(pages)}`
+- **LLM extraction chunks:** `{len(chunks)}`
+- **Extracted candidate rules:** `{len(extracted_doc.get('rules', []))}`
+- **Normalized rules:** `{norm_summary.get('output_rule_count', 0)}`
+- **Auto-evaluable rules:** `{norm_summary.get('automated_rule_count', 0)}`
+- **Normalization review-only rules:** `{norm_summary.get('needs_human_review_count', 0)}`
+
+### Check results
+- **PASS:** `{report['pass_count']}`
+- **FAIL:** `{report['fail_count']}`
+- **NEEDS HUMAN REVIEW:** `{report['needs_human_review_count']}`
+- **Total rules:** `{report['total_rules']}`
+
+The downloadable artifact is the generated HTML report.
 """.strip()
 
-    # Stub artifact to prove downloads work.
-    out_name = f"run_stub_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(out_name, "w", encoding="utf-8") as f:
-        f.write("Compliance Assistant (UI Wiring Test)\n\n")
-        f.write(f"Policy PDF: {pdf_name}\n")
-        f.write(f"Config TXT: {cfg_name}\n")
-        f.write(f"Vendor: {vendor}\n")
-        f.write(f"Strictness: {strictness}\n")
+        return md, gr.update(visible=True, value=str(html_path))
 
-    return md, gr.update(visible=True, value=out_name)
+    except Exception as exc:
+        fail_dir = None
+        try:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
+            fail_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fail_dir = RUNS_DIR / f"run_failed_{fail_stamp}"
+            fail_dir.mkdir(parents=True, exist_ok=True)
+            (fail_dir / "ui_error.txt").write_text(
+                f"{type(exc).__name__}: {exc}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        extra = f"\n5. Inspect the saved debug folder: `{fail_dir}`" if fail_dir else ""
+        err_md = f"""
+### ❌ Run failed
+
+**Error:** `{type(exc).__name__}: {exc}`
+
+Check these first:
+1. The PDF contains selectable text (not only scanned images).
+2. `.env` contains a valid TAMU API key and base URL.
+3. Required packages are installed: `gradio`, `requests`, `pypdf`.
+4. You selected **Cisco IOS** as vendor mode.{extra}
+""".strip()
+        return err_md, gr.update(visible=False, value=None)
 
 
 # ------------------------------------------------------------
@@ -136,8 +739,8 @@ def begin_shutdown():
         os._exit(0)
     threading.Timer(0.9, _kill).start()
     return (
-        gr.update(visible=False),  # main_ui
-        gr.update(visible=True),   # shutdown_ui
+        gr.update(visible=False),
+        gr.update(visible=True),
     )
 
 
@@ -154,7 +757,7 @@ BORDER      = "#E2DDD8"
 BORDER_SOFT = "rgba(80,0,0,0.12)"
 TEXT        = "#1A1A1A"
 TEXT_MUTED  = "#5A5A5A"
-ACCENT_BLUE = "#1D4E8F"   # small accent for contrast (TAMU secondary)
+ACCENT_BLUE = "#1D4E8F"
 
 
 css = f"""
@@ -185,7 +788,6 @@ css = f"""
   --shadow-drop-lg:               0 4px 24px rgba(0,0,0,0.10) !important;
 }}
 
-/* ── Base ───────────────────────────────────────────────── */
 html, body {{
   background: {OFF_WHITE} !important;
   font-family: 'DM Sans', sans-serif !important;
@@ -202,7 +804,6 @@ html, body {{
 
 footer {{ display: none !important; }}
 
-/* ── Top header bar ─────────────────────────────────────── */
 #topbar {{
   background: linear-gradient(135deg, {MAROON} 0%, {MAROON_MID} 60%, {MAROON_DARK} 100%);
   border-radius: 18px;
@@ -212,7 +813,6 @@ footer {{ display: none !important; }}
   position: relative;
   overflow: hidden;
 }}
-/* Force all children of topbar to inherit the maroon bg */
 #topbar > div,
 #topbar > div > div,
 #topbar .gap,
@@ -226,8 +826,6 @@ footer {{ display: none !important; }}
   box-shadow: none !important;
   color: #fff !important;
 }}
-
-/* subtle grain texture on header */
 #topbar::after {{
   content: '';
   position: absolute;
@@ -253,7 +851,6 @@ footer {{ display: none !important; }}
   font-weight: 400;
 }}
 
-/* ── Exit button ─────────────────────────────────────────── */
 #exitbtn button {{
   background: rgba(255,255,255,0.12) !important;
   color: #fff !important;
@@ -272,7 +869,6 @@ footer {{ display: none !important; }}
   border-color: rgba(255,255,255,0.60) !important;
 }}
 
-/* ── Cards ───────────────────────────────────────────────── */
 .card {{
   background: {CARD_BG} !important;
   border-radius: 18px !important;
@@ -292,7 +888,6 @@ footer {{ display: none !important; }}
   letter-spacing: -0.01em;
 }}
 
-/* ── Help / hint boxes ───────────────────────────────────── */
 .helpbox {{
   background: #FDFCFB;
   border: 1px solid {BORDER};
@@ -316,8 +911,6 @@ footer {{ display: none !important; }}
   color: {TEXT_MUTED};
 }}
 
-/* ── File upload dropzones — force light ─────────────────── */
-/* Target all possible Gradio upload-area elements */
 .upload-container,
 [data-testid="file"] .upload-container,
 .svelte-file-uploader,
@@ -330,8 +923,6 @@ div[data-testid="file"] > div > div {{
   background: {INPUT_BG} !important;
   color: {TEXT} !important;
 }}
-
-/* The dashed drop area */
 .file-drop-zone,
 [class*="file-drop"],
 .upload-container > label,
@@ -342,19 +933,14 @@ div[data-testid="file"] > div > div {{
   border: 1.5px dashed {BORDER_SOFT} !important;
   border-radius: 14px !important;
 }}
-
-/* Gradio 4/5 upload component internals */
 .block.svelte-1tcem6n,
 .wrap.svelte-1tcem6n {{
   background: {INPUT_BG} !important;
 }}
-
-/* Override any dark-themed child elements in file widgets */
 [data-testid="file"] * {{
   background-color: transparent !important;
   color: {TEXT} !important;
 }}
-
 [data-testid="file"] .upload-container {{
   background: {INPUT_BG} !important;
   border: 1.5px dashed rgba(80,0,0,0.25) !important;
@@ -366,23 +952,17 @@ div[data-testid="file"] > div > div {{
   border-color: {MAROON} !important;
   background: rgba(80,0,0,0.025) !important;
 }}
-
-/* Upload icon color */
 [data-testid="file"] svg {{
   color: {MAROON} !important;
   fill: none !important;
   stroke: {MAROON} !important;
 }}
-
-/* "Drop File Here" text */
 [data-testid="file"] .upload-container span,
 [data-testid="file"] .upload-container p {{
   color: {TEXT_MUTED} !important;
   font-family: 'DM Sans', sans-serif !important;
   font-size: 0.90rem !important;
 }}
-
-/* Gradio block backgrounds (panels, etc.) */
 .block, .panel, .gap {{
   background: {CARD_BG} !important;
 }}
@@ -390,7 +970,6 @@ div[data-testid="file"] > div > div {{
   background: {CARD_BG} !important;
 }}
 
-/* ── Accordion / Settings ────────────────────────────────── */
 .accordion,
 details,
 details > summary {{
@@ -416,7 +995,6 @@ details > div {{
   padding: 14px !important;
 }}
 
-/* ── Dropdown ────────────────────────────────────────────── */
 select, .gr-dropdown, [data-testid="dropdown"] {{
   background: {INPUT_BG} !important;
   color: {TEXT} !important;
@@ -425,13 +1003,11 @@ select, .gr-dropdown, [data-testid="dropdown"] {{
   font-family: 'DM Sans', sans-serif !important;
 }}
 
-/* ── Radio buttons ───────────────────────────────────────── */
 .gr-radio label, .radio-group label {{
   color: {TEXT} !important;
   font-family: 'DM Sans', sans-serif !important;
 }}
 
-/* ── Run Compliance Check button ─────────────────────────── */
 #runbtn button,
 button.primary,
 .gr-button-primary {{
@@ -457,7 +1033,6 @@ button.primary:hover {{
   transform: translateY(0) !important;
 }}
 
-/* ── Download button ─────────────────────────────────────── */
 .gr-download button,
 [data-testid="download-btn"] button {{
   background: {INPUT_BG} !important;
@@ -471,7 +1046,6 @@ button.primary:hover {{
   background: rgba(80,0,0,0.06) !important;
 }}
 
-/* ── Status / output markdown box ────────────────────────── */
 #statusbox {{
   background: {INPUT_BG};
   border: 1px solid {BORDER};
@@ -499,12 +1073,10 @@ button.primary:hover {{
   margin-top: 0;
 }}
 
-/* ── Section dividers between file+helpbox rows ──────────── */
 .input-row {{
   margin-bottom: 16px;
 }}
 
-/* ── Shutdown screen ─────────────────────────────────────── */
 #shutdown-wrap {{
   background: {CARD_BG};
   border: 1px solid {BORDER};
@@ -526,24 +1098,18 @@ button.primary:hover {{
   margin: 6px 0;
 }}
 
-/* ── Generic label & block title overrides ───────────────── */
 label span, .block-title, .label-wrap {{
   color: {TEXT} !important;
   font-family: 'DM Sans', sans-serif !important;
   font-weight: 600 !important;
 }}
 
-/* Ensure nothing is dark-mode tinted — but NOT inside topbar */
 :not(#topbar):not(#topbar *) {{
   --background-fill-primary: {CARD_BG} !important;
 }}
 """
 
 
-# ------------------------------------------------------------
-# Build the Gradio layout
-# NOTE: In Gradio 4+, pass theme + css to gr.Blocks(), not launch()
-# ------------------------------------------------------------
 theme = gr.themes.Base(
     primary_hue=gr.themes.Color(
         c50="#fdf2f2", c100="#fce8e8", c200="#f9d0d0", c300="#f5a8a8",
@@ -555,8 +1121,6 @@ theme = gr.themes.Base(
 )
 
 with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css) as demo:
-
-    # ── Header ────────────────────────────────────────────────
     with gr.Row(elem_id="topbar"):
         with gr.Column(scale=8):
             gr.HTML("""
@@ -566,15 +1130,11 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
         with gr.Column(scale=2, min_width=130):
             exit_btn = gr.Button("⏻  Exit", elem_id="exitbtn")
 
-    # ── Main app view ──────────────────────────────────────────
     with gr.Column(visible=True) as main_ui:
         with gr.Row(equal_height=True):
-
-            # ── LEFT: Inputs card ──────────────────────────────
             with gr.Column(scale=6, elem_classes=["card"]):
                 gr.HTML('<div class="card-title">📂 Inputs</div>')
 
-                # Policy PDF
                 with gr.Row(elem_classes=["input-row"]):
                     with gr.Column(scale=6):
                         intent_pdf = gr.File(
@@ -591,7 +1151,6 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
                             </div>
                         """)
 
-                # Config TXT
                 with gr.Row(elem_classes=["input-row"]):
                     with gr.Column(scale=6):
                         config_txt = gr.File(
@@ -608,7 +1167,6 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
                             </div>
                         """)
 
-                # Settings accordion
                 with gr.Accordion("⚙️  Settings", open=False):
                     with gr.Row():
                         with gr.Column(scale=6):
@@ -646,7 +1204,6 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
                     elem_id="runbtn",
                 )
 
-            # ── RIGHT: Outputs card ────────────────────────────
             with gr.Column(scale=6, elem_classes=["card"]):
                 gr.HTML('<div class="card-title">📊 Outputs</div>')
 
@@ -665,12 +1222,11 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
                 gr.HTML("""
                     <div class="helpbox" style="margin-top:14px;">
                       <strong>📦 Artifacts</strong>
-                      Download the generated report after each run.<br/>
-                      <span class="muted">Stub .txt now — full HTML + JSON evidence report once the backend is connected.</span>
+                      Download the generated HTML report after each run.<br/>
+                      <span class="muted">The app also saves extracted rules, normalized rules, and JSON check results in a timestamped <code>runs/</code> folder.</span>
                     </div>
                 """)
 
-    # ── Shutdown view ──────────────────────────────────────────
     with gr.Column(visible=False) as shutdown_ui:
         gr.HTML("""
             <div id="shutdown-wrap">
@@ -680,7 +1236,6 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
             </div>
         """)
 
-    # ── Event wiring ───────────────────────────────────────────
     run_btn.click(
         fn=submit,
         inputs=[intent_pdf, config_txt, vendor, strictness],
@@ -694,9 +1249,7 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
     )
 
 
-# ------------------------------------------------------------
-# Launch
-# ------------------------------------------------------------
 if __name__ == "__main__":
+    RUNS_DIR.mkdir(exist_ok=True)
     demo.queue()
     demo.launch(inbrowser=True)
