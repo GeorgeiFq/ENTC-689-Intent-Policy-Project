@@ -5,188 +5,30 @@
 #
 # PURPOSE
 # -------
-# This file converts raw AI-extracted policy rules into a structured,
-# deterministic, backend-ready JSON format that the compliance checker
-# can safely evaluate.
+# Converts raw AI-extracted policy rules into a structured,
+# deterministic, backend-ready JSON format that checks_ios.py can
+# safely evaluate.
 #
-# In other words:
+# DESIGN NOTES
+# ------------
+# This version keeps the original project schema, but fixes several
+# normalization issues that were causing inaccurate reports:
+#   1) explicit required "no ..." commands are preserved as REQUIRED
+#      commands instead of being rewritten into forbids of the positive
+#      form
+#   2) common Cisco IOS command families are normalized more flexibly
+#      so valid syntax variants are not falsely failed
+#   3) duplicate benchmark IDs like CIS_IOS_1_2_1_1 and 1.2.1.1 are
+#      canonicalized and merged more cleanly
+#   4) some review heuristics are slightly narrower so clearly
+#      deterministic rules are not over-downgraded
 #
-#   raw LLM rule output  ->  normalized deterministic rule objects
-#
-# WHY THIS FILE EXISTS
-# --------------------
-# The AI extraction stage is useful for reading policy PDFs, but the
-# output from an LLM is not guaranteed to be directly usable by the
-# checker.
-#
-# Common problems in raw AI output include:
-#   - inconsistent field naming
-#   - vague or non-deterministic requirement wording
-#   - duplicate rules
-#   - wrong or missing scope hints
-#   - placeholder text like {server_ip} or <username>
-#   - rules that should be manual review rather than automated
-#
-# This file solves that problem by transforming raw extracted rules
-# into a cleaner schema that the deterministic checker can trust.
-#
-# ARCHITECTURE ROLE
-# -----------------
-# This file sits between:
-#
-#   1) the AI extraction stage
-#      and
-#   2) the deterministic compliance checker
-#
-# Pipeline position:
-#
-#   PDF text
-#      -> AI extracts candidate JSON rules
-#      -> normalize.py standardizes them
-#      -> checks_ios.py evaluates them
-#
-# WHAT THIS FILE DOES
-# -------------------
-# This module:
-#   - standardizes the normalization schema version
-#   - cleans text fields
-#   - removes duplicate items in lists
-#   - canonicalizes vendor labels
-#   - canonicalizes rule scope values
-#   - canonicalizes check kinds
-#   - converts extracted command strings into regex matchers
-#   - marks ambiguous rules for human review
-#   - splits one multi-scope rule into multiple simpler scoped rules
-#   - validates the final normalized rule structure
-#   - produces a summary of normalization warnings/errors
-#
-# NORMALIZED RULE STRUCTURE
-# -------------------------
-# The output schema is designed for deterministic checking and includes:
-#   - rule_id
-#   - title
-#   - vendor
-#   - original requirement text
-#   - source metadata
-#   - scope
-#   - check logic
-#   - automation status
-#   - review reason
-#   - normalization notes
-#   - raw original rule
-#
-# SCOPES
-# ------
-# The current MVP supports these scope types:
-#   - global
-#   - line_vty
-#   - line_console
-#   - line_aux
-#   - unknown
-#
-# A scope tells the checker where the rule should be evaluated:
-#   - globally across top-level config lines
-#   - inside a VTY block
-#   - inside a console block
-#   - inside an auxiliary line block
-#
-# If the scope cannot be determined safely, the rule is downgraded
-# to unknown or needs human review rather than pretending to know.
-#
-# CHECK KINDS
-# -----------
-# The normalized check logic uses one of these kinds:
-#   - requires
-#   - forbids
-#   - requires_and_forbids
-#   - manual_review
-#
-# This makes the downstream checker simpler and more explainable.
-#
-# PATTERN NORMALIZATION
-# ---------------------
-# Raw extracted commands are converted into deterministic line matchers.
-# Examples:
-#   - exact command lines
-#   - anchored regex line patterns
-#   - placeholder-based commands converted into prefix matchers
-#
-# This step is very important because many policy documents describe
-# commands abstractly rather than with exact final config syntax.
-#
-# HUMAN REVIEW LOGIC
-# ------------------
-# Some rules should not be auto-evaluated even if the AI extracted them.
-# This file identifies such cases and marks them as
-# "needs_human_review".
-#
-# Examples include:
-#   - vague requirements
-#   - interface-scoped rules not modeled by current backend
-#   - conditional rules like "if protocol is used"
-#   - operational/prerequisite actions that are not stable config lines
-#   - rules whose extracted patterns do not fully match the rule title
-#
-# This is a safety feature, not a weakness.
-# It prevents the project from overstating what it can evaluate.
-#
-# RULE SPLITTING
-# --------------
-# If one extracted rule applies to multiple scopes, this file may split
-# it into multiple normalized rules.
-#
-# Example:
-#   "Require timeout for console and VTY lines"
-#
-# can become:
-#   - rule_id__line_console
-#   - rule_id__line_vty
-#
-# This makes deterministic checking simpler and easier to explain.
-#
-# DEDUPLICATION
-# -------------
-# Raw or normalized rules can contain duplicates, especially if the AI
-# extracts similar benchmark items from multiple sections or pages.
-#
-# This file can merge duplicate normalized rules so the final report is
-# cleaner and more meaningful.
-#
-# VALIDATION
-# ----------
-# Before sending rules to the checker, this file validates that each
-# normalized rule has the required fields and a valid structure.
-#
-# Any issues are captured in the normalization summary rather than
-# failing silently.
-#
-# OUTPUT
-# ------
-# The final output of this file is a normalized document object with:
-#   - schema version
-#   - document name
-#   - list of normalized rules
-#   - normalization summary
-#
-# This output is what checks_ios.py consumes.
-#
-# IMPORTANT DESIGN PRINCIPLE
-# --------------------------
-# This file does NOT decide PASS or FAIL.
-#
-# It only decides whether a rule can be represented safely in a
-# deterministic form.
-#
-# Final compliance decisions happen later in checks_ios.py.
-#
-# SUMMARY
-# -------
-# normalize.py is the bridge between AI-generated policy extraction
-# and deterministic config checking.
-#
-# It turns messy candidate rules into structured, safer, cleaner,
-# backend-ready rule objects.
+# IMPORTANT
+# ---------
+# This file does NOT decide PASS/FAIL. It only decides whether a rule
+# can be represented safely in deterministic form.
 # ============================================================
+
 import json
 import re
 from copy import deepcopy
@@ -194,20 +36,19 @@ from copy import deepcopy
 
 SCHEMA_VERSION = "1.0"
 
-
 ALLOWED_SCOPES = {
     "global",
     "line_vty",
     "line_console",
     "line_aux",
-    "unknown"
+    "unknown",
 }
 
 ALLOWED_CHECK_KINDS = {
     "requires",
     "forbids",
     "requires_and_forbids",
-    "manual_review"
+    "manual_review",
 }
 
 
@@ -267,8 +108,8 @@ def empty_normalized_document(document_name=""):
             "needs_human_review_count": 0,
             "deduplicated_rule_count": 0,
             "errors": [],
-            "warnings": []
-        }
+            "warnings": [],
+        },
     }
 
 
@@ -276,9 +117,61 @@ def make_source(raw_rule):
     return {
         "page": raw_rule.get("source_page"),
         "section": raw_rule.get("source_section"),
-        "excerpt": raw_rule.get("source_excerpt") or raw_rule.get("requirement_text", "")
+        "excerpt": raw_rule.get("source_excerpt") or raw_rule.get("requirement_text", ""),
     }
 
+
+
+def canonical_rule_id(rule_id, title="", source_section=""):
+    """
+    Normalize benchmark rule ids while trying hard to preserve the full
+    dotted CIS section number.
+
+    Priority:
+      1) explicit rule_id field
+      2) explicit source_section field
+      3) title only when it clearly starts with a section number
+
+    This avoids accidentally shortening ids because a title happens to
+    contain a partial number like "2.3.1".
+    """
+
+    def dotted_from_text(raw, allow_title_fallback=False):
+        raw = clean_text(raw)
+        if not raw:
+            return None
+
+        # Exact dotted ids anywhere in explicit id/section fields.
+        m = re.search(r"\b(\d+(?:\.\d+){1,6})\b", raw)
+        if m:
+            return m.group(1)
+
+        # Convert underscore-separated numeric tails like CIS_IOS_1_2_3_1.
+        m = re.search(r"(?:^|[^\d])(\d+(?:_\d+){1,6})(?:$|[^\d])", raw)
+        if m:
+            return m.group(1).replace("_", ".")
+
+        # Only use the title when the section number is clearly leading.
+        if allow_title_fallback:
+            m = re.match(r"^\s*(\d+(?:\.\d+){1,6})\b", raw)
+            if m:
+                return m.group(1)
+            m = re.search(r"\bsection\s+(\d+(?:\.\d+){1,6})\b", raw, flags=re.IGNORECASE)
+            if m:
+                return m.group(1)
+
+        return None
+
+    for raw in [rule_id, source_section]:
+        found = dotted_from_text(raw, allow_title_fallback=False)
+        if found:
+            return found
+
+    found = dotted_from_text(title, allow_title_fallback=True)
+    if found:
+        return found
+
+    return clean_text(rule_id) or clean_text(source_section) or "unknown_rule"
 
 def make_scope(scope_type):
     if scope_type not in ALLOWED_SCOPES:
@@ -287,24 +180,24 @@ def make_scope(scope_type):
     mapping = {
         "global": {
             "scope_type": "global",
-            "block_header_patterns": []
+            "block_header_patterns": [],
         },
         "line_vty": {
             "scope_type": "line_vty",
-            "block_header_patterns": [r"^line\s+vty\b"]
+            "block_header_patterns": [r"^line\s+vty\b"],
         },
         "line_console": {
             "scope_type": "line_console",
-            "block_header_patterns": [r"^line\s+con(?:sole)?\b"]
+            "block_header_patterns": [r"^line\s+con(?:sole)?\b"],
         },
         "line_aux": {
             "scope_type": "line_aux",
-            "block_header_patterns": [r"^line\s+aux\b"]
+            "block_header_patterns": [r"^line\s+aux\b"],
         },
         "unknown": {
             "scope_type": "unknown",
-            "block_header_patterns": []
-        }
+            "block_header_patterns": [],
+        },
     }
     return mapping[scope_type]
 
@@ -313,7 +206,7 @@ def make_matcher(pattern, matcher_type="regex_line"):
     return {
         "pattern": pattern,
         "matcher_type": matcher_type,
-        "case_sensitive": False
+        "case_sensitive": False,
     }
 
 
@@ -328,7 +221,7 @@ def validate_normalized_rule(rule):
         "source",
         "scope",
         "check",
-        "automation_status"
+        "automation_status",
     ]
 
     for field in required_top_fields:
@@ -343,7 +236,7 @@ def validate_normalized_rule(rule):
     if check.get("kind") not in ALLOWED_CHECK_KINDS:
         errors.append(f"Invalid check.kind: {check.get('kind')}")
 
-    for key in ["required", "forbidden"]:
+    for key in ["required", "required_all", "required_any", "forbidden"]:
         value = check.get(key, [])
         if not isinstance(value, list):
             errors.append(f"check.{key} must be a list")
@@ -406,10 +299,11 @@ def infer_scope_from_text(title, requirement_text, source_excerpt, fallback_scop
         if explicit:
             return unique_preserve(explicit)
 
-    title_l = clean_text(title).lower()
-    req_l = clean_text(requirement_text).lower()
-    excerpt_l = clean_text(source_excerpt).lower()
-    text = " ".join([title_l, req_l, excerpt_l])
+    text = " ".join([
+        clean_text(title).lower(),
+        clean_text(requirement_text).lower(),
+        clean_text(source_excerpt).lower(),
+    ])
 
     scopes = []
 
@@ -459,7 +353,7 @@ def looks_like_regex(pattern):
 
 def escape_prefix_regex(prefix):
     """
-    Turn plain command text into a prefix matcher that still requires a value.
+    Turn plain command text into a prefix matcher that allows values.
     Example: 'ntp server' -> '^ntp\\ server(?:\\s+.+)?$'
     """
     prefix = clean_text(prefix)
@@ -468,14 +362,52 @@ def escape_prefix_regex(prefix):
     return rf"^{re.escape(prefix)}(?:\s+.+)?$"
 
 
+def special_case_matcher_for_plain_command(command_text):
+    """
+    Flexible matchers for common Cisco IOS command families where the
+    benchmark remediation line is often only one valid variant.
+    """
+    p = clean_text(command_text)
+    l = p.lower()
+
+    # Accept legitimate timestamp variants such as:
+    # service timestamps debug datetime msec localtime show-timezone year
+    if l == "service timestamps debug datetime":
+        return make_matcher(r"^service\s+timestamps\s+debug\s+datetime(?:\s+\S+)*$"), [
+            "Broadened service timestamps debug matcher to allow valid Cisco datetime options."
+        ]
+
+    if l == "service timestamps log datetime":
+        return make_matcher(r"^service\s+timestamps\s+log\s+datetime(?:\s+\S+)*$"), [
+            "Broadened service timestamps log matcher to allow valid Cisco datetime options."
+        ]
+
+    # Banner commands frequently include delimiter + message on the same line.
+    if re.fullmatch(r"banner\s+(exec|login|motd)", l):
+        return make_matcher(rf"^{re.escape(p)}(?:\s+.+)?$"), [
+            "Broadened banner matcher to allow inline banner text/delimiters."
+        ]
+
+    # Permit loopback suffix values when extractor only gives the stem.
+    if l in {"ntp source loopback", "ip tftp source-interface loopback", "snmp-server trap-source loopback", "logging source-interface loopback"}:
+        return make_matcher(rf"^{re.escape(p)}(?:\s*\d+)?(?:\s+.+)?$"), [
+            "Broadened loopback stem matcher to allow interface suffix values."
+        ]
+
+    return None, []
+
+
 def normalize_single_pattern(pattern):
     """
     Convert extracted command-like patterns into backend line matchers.
 
-    Important improvements:
+    Rules:
     - Preserve already-regex-like patterns.
     - Convert placeholder/trailing-space templates into wildcard prefixes.
-    - Avoid collapsing 'logging host ' into '^logging host$'.
+    - Broaden a few Cisco command families that commonly have valid
+      option/value variants.
+    - Keep explicit negated commands like 'no cdp run' as exact REQUIRED
+      commands when they are extracted that way.
     """
     original = clean_text(pattern)
     if not original:
@@ -484,10 +416,10 @@ def normalize_single_pattern(pattern):
     notes = []
     p = original
 
-    # Strip common CLI prompt prefixes if they slipped through
+    # Strip common CLI prompt prefixes if they slipped through.
     p = re.sub(r"^\S+\(config(?:-[^)]+)?\)#\s*", "", p, flags=re.IGNORECASE)
 
-    # If it already looks regex-like, anchor it unless already anchored.
+    # If it already looks regex-like, anchor unless already anchored.
     if looks_like_regex(p):
         anchored = p
         if not anchored.startswith("^"):
@@ -496,27 +428,47 @@ def normalize_single_pattern(pattern):
             anchored = anchored + "$"
         return make_matcher(anchored, matcher_type="regex_line"), notes
 
-    # Patterns ending with whitespace almost always mean "command + argument"
+    special_matcher, special_notes = special_case_matcher_for_plain_command(p)
+    if special_matcher:
+        return special_matcher, special_notes
+
+    # Patterns ending with whitespace usually mean "command + argument".
     if original.endswith(" "):
         prefix = original.rstrip()
         notes.append(f"Converted trailing-space template into prefix matcher: {original}")
         return make_matcher(escape_prefix_regex(prefix), matcher_type="regex_line"), notes
 
-    # Curly/angle placeholders mean "some value goes here"
+    # Curly/angle placeholders mean "some value goes here".
     if any(tok in p for tok in ["{", "}", "<", ">"]):
         prefix = re.split(r"[\{\<]", p, maxsplit=1)[0].strip()
         if prefix:
             notes.append(f"Converted placeholder-based command into prefix matcher: {original}")
             return make_matcher(escape_prefix_regex(prefix), matcher_type="regex_line"), notes
 
-    # UPPERCASE token placeholders like LINE_PASSWORD / LOCAL_USERNAME
+    # UPPERCASE token placeholders like LINE_PASSWORD / LOCAL_USERNAME.
     if re.search(r"\b[A-Z][A-Z0-9_]{2,}\b", p):
         prefix = re.split(r"\b[A-Z][A-Z0-9_]{2,}\b", p, maxsplit=1)[0].strip()
         if prefix:
             notes.append(f"Converted all-caps placeholder command into prefix matcher: {original}")
             return make_matcher(escape_prefix_regex(prefix), matcher_type="regex_line"), notes
 
-    # Safe fallback: exact whole-line match
+    # Common stems that are usually followed by values even when extractor omits placeholders.
+    prefix_stems = (
+        "aaa authentication ",
+        "aaa authorization ",
+        "aaa accounting ",
+        "logging host",
+        "ntp server",
+        "snmp-server host",
+        "username",
+        "ip access-list",
+        "banner ",
+    )
+    if any(p.lower().startswith(stem) for stem in prefix_stems):
+        notes.append(f"Converted command stem into prefix matcher: {original}")
+        return make_matcher(escape_prefix_regex(p), matcher_type="regex_line"), notes
+
+    # Safe fallback: exact whole-line match.
     escaped = re.escape(p)
     return make_matcher(rf"^{escaped}$", matcher_type="regex_line"), notes
 
@@ -532,14 +484,13 @@ def normalize_patterns(patterns):
         notes.extend(matcher_notes)
 
         lowered = p.lower()
-
         if any(token in lowered for token in ["{", "}", "<", ">"]):
             notes.append(f"Pattern contains placeholders and was generalized where possible: {p}")
 
         if "or equivalent" in lowered or "as appropriate" in lowered:
             notes.append(f"Pattern is policy-language-like and may not be directly matchable: {p}")
 
-    # dedupe normalized matcher patterns
+    # De-duplicate normalized matcher patterns.
     deduped = []
     seen = set()
     for m in out:
@@ -556,7 +507,7 @@ def should_treat_as_interface_rule(title, requirement_text, source_excerpt):
     text = " ".join([
         clean_text(title).lower(),
         clean_text(requirement_text).lower(),
-        clean_text(source_excerpt).lower()
+        clean_text(source_excerpt).lower(),
     ])
     interface_markers = [
         "each interface",
@@ -575,7 +526,7 @@ def should_treat_as_conditional_rule(title, requirement_text, source_excerpt):
     text = " ".join([
         clean_text(title).lower(),
         clean_text(requirement_text).lower(),
-        clean_text(source_excerpt).lower()
+        clean_text(source_excerpt).lower(),
     ])
     conditional_markers = [
         "if protocol is used",
@@ -589,12 +540,47 @@ def should_treat_as_conditional_rule(title, requirement_text, source_excerpt):
     return any(marker in text for marker in conditional_markers)
 
 
+def is_safe_conditional_family(title, requirement_text, source_excerpt, required_patterns, forbidden_patterns):
+    """
+    Some benchmark text says 'if used' but still maps cleanly to a
+    stable line assertion. Allow these to remain automated.
+    """
+    text = " ".join([
+        clean_text(title).lower(),
+        clean_text(requirement_text).lower(),
+        clean_text(source_excerpt).lower(),
+        " ".join(clean_list(required_patterns)).lower(),
+        " ".join(clean_list(forbidden_patterns)).lower(),
+    ])
+
+    safe_markers = [
+        "ntp server",
+        "ntp source",
+        "logging host",
+        "logging source-interface",
+        "service timestamps",
+        "clock timezone",
+        "clock summer-time",
+        "cdp run",
+        "ip http server",
+        "ip http secure-server",
+        "snmp-server",
+        "snmp community",
+        "vty transport ssh",
+        "transport input ssh",
+        "exec-timeout",
+        "access-class",
+        "ipv6 access-class",
+    ]
+    return any(marker in text for marker in safe_markers)
+
+
 def should_treat_as_operational_rule(title, requirement_text, source_excerpt, required_patterns):
     text = " ".join([
         clean_text(title).lower(),
         clean_text(requirement_text).lower(),
         clean_text(source_excerpt).lower(),
-        " ".join(clean_list(required_patterns)).lower()
+        " ".join(clean_list(required_patterns)).lower(),
     ])
     operational_markers = [
         "write mem",
@@ -605,6 +591,69 @@ def should_treat_as_operational_rule(title, requirement_text, source_excerpt, re
         "review manually",
     ]
     return any(marker in text for marker in operational_markers)
+
+
+
+
+def rule_text_blob(rule):
+    return " ".join([
+        clean_text(rule.get("title")).lower(),
+        clean_text(rule.get("requirement_text")).lower(),
+        clean_text(rule.get("source_excerpt")).lower(),
+        " ".join(clean_list(rule.get("required_patterns", []))).lower(),
+        " ".join(clean_list(rule.get("forbidden_patterns", []))).lower(),
+    ])
+
+
+def is_known_not_scorable_family(rule):
+    text = rule_text_blob(rule)
+    if "not scorable" in text:
+        return True
+    if "finger service" in text and "service finger" in text:
+        return True
+    return False
+
+
+def is_safe_deterministic_family(rule):
+    text = rule_text_blob(rule)
+
+    safe_markers = [
+        "clock timezone",
+        "clock summer-time",
+        "cdp run",
+        "ip bootp server",
+        "service timestamps debug",
+        "service timestamps log",
+        "ntp server",
+        "require logging",
+        "logging host",
+        "logging trap",
+        "logging buffered",
+        "logging console",
+        "logging source-interface",
+        "transport input ssh",
+        "vty transport ssh",
+        "ssh for remote device access",
+        "timeout for login sessions",
+        "exec-timeout",
+        "ssh access control",
+        "vty acl",
+        "access-class",
+        "ipv6 access-class",
+        "snmp community string public",
+        "snmp community string private",
+        "snmp read and write access",
+        "snmp ifindex persist",
+        "snmp-server ifindex persist",
+        "ip ssh version",
+        "ip ssh authentication-retries",
+        "ip ssh time-out",
+        "ip ssh timeout",
+        "service password-encryption",
+        "enable secret",
+        "aaa new-model",
+    ]
+    return any(marker in text for marker in safe_markers)
 
 
 def title_based_review_flags(rule):
@@ -622,19 +671,28 @@ def title_based_review_flags(rule):
     needs_review = False
     reason = None
 
-    if "require ssh for remote device access" in title:
+    if is_known_not_scorable_family(rule):
         needs_review = True
-        reason = "Title implies protocol exclusivity, but extracted patterns do not fully encode that logic."
-        notes.append("Recommend handling SSH protocol restriction primarily through VTY transport checks.")
+        reason = "Benchmark text indicates this control is not safely scorable from running-config alone."
+        notes.append("Kept as human review to avoid overclaiming a deterministic result.")
         return needs_review, reason, notes
+
+    if is_safe_deterministic_family(rule):
+        return False, None, notes
 
     if should_treat_as_interface_rule(title, requirement_text, source_excerpt):
         needs_review = True
         reason = "Rule appears interface-scoped, but current backend does not model interface blocks yet."
-        notes.append("Downgraded to human review instead of forcing an unreliable global check.")
+        notes.append("Downgraded to human review instead of forcing an unreliable interface check.")
         return needs_review, reason, notes
 
-    if should_treat_as_conditional_rule(title, requirement_text, source_excerpt):
+    if should_treat_as_conditional_rule(title, requirement_text, source_excerpt) and not is_safe_conditional_family(
+        title,
+        requirement_text,
+        source_excerpt,
+        required_patterns,
+        forbidden_patterns,
+    ):
         needs_review = True
         reason = "Rule is conditional ('if used' / 'if not in use') and current backend does not model that condition safely."
         notes.append("Downgraded to human review until conditional logic is added.")
@@ -651,7 +709,7 @@ def title_based_review_flags(rule):
         "ensure",
         "appropriate",
         "sufficient",
-        "securely configured"
+        "securely configured",
     ]
 
     if any(v in requirement_text for v in vague_phrases) and not required_patterns and not forbidden_patterns:
@@ -694,16 +752,16 @@ def drop_scope_header_matchers(variant):
     filtered_required = []
     dropped = []
 
-    for matcher in variant["check"]["required"]:
+    for matcher in variant["check"]["required_all"]:
         patt = clean_text(matcher.get("pattern"))
         if not patt:
             continue
 
         line_header_like = (
-            patt.startswith("^line ") or
-            patt.startswith("^line\\ ") or
-            patt.startswith("^line\\s+") or
-            patt.startswith("line ")
+            patt.startswith("^line ")
+            or patt.startswith("^line\\ ")
+            or patt.startswith("^line\\s+")
+            or patt.startswith("line ")
         )
 
         if line_header_like:
@@ -713,7 +771,8 @@ def drop_scope_header_matchers(variant):
         filtered_required.append(matcher)
 
     if dropped:
-        variant["check"]["required"] = filtered_required
+        variant["check"]["required_all"] = filtered_required
+        variant["check"]["required"] = list(filtered_required)
         variant["normalization_notes"].append(
             "Dropped block-header matcher(s) from scoped rule: " + ", ".join(dropped)
         )
@@ -735,12 +794,10 @@ def apply_scope_specific_tuning(variant):
         variant["review_reason"] = "Auxiliary line SSH transport semantics are not reliable for this benchmark rule in current backend."
         variant["normalization_notes"].append("Aux variant downgraded to human review.")
 
-    # If a scoped rule lost all deterministic required patterns after header cleanup,
-    # it should not stay automated.
     if (
         variant["automation_status"] == "automated"
         and variant["check"]["kind"] in {"requires", "requires_and_forbids"}
-        and len(variant["check"]["required"]) == 0
+        and len(variant["check"]["required_all"]) == 0
         and len(variant["check"]["forbidden"]) == 0
     ):
         variant["automation_status"] = "needs_human_review"
@@ -748,8 +805,13 @@ def apply_scope_specific_tuning(variant):
         variant["normalization_notes"].append("Downgraded to human review after scoped matcher cleanup.")
 
 
+
 def normalize_rule(raw_rule, document_name=""):
-    rule_id = clean_text(raw_rule.get("rule_id")) or "unknown_rule"
+    rule_id = canonical_rule_id(
+        raw_rule.get("rule_id"),
+        title=raw_rule.get("title", ""),
+        source_section=raw_rule.get("source_section", ""),
+    )
     title = clean_text(raw_rule.get("title")) or rule_id
     requirement_text = clean_text(raw_rule.get("requirement_text"))
     source_excerpt = clean_text(raw_rule.get("source_excerpt"))
@@ -761,7 +823,7 @@ def normalize_rule(raw_rule, document_name=""):
     check_kind = canonical_check_kind(
         raw_rule.get("check_type", ""),
         required_patterns,
-        forbidden_patterns
+        forbidden_patterns,
     )
 
     hinted_scopes = parse_scope_hint(raw_rule.get("scope_hint", ""))
@@ -769,7 +831,6 @@ def normalize_rule(raw_rule, document_name=""):
 
     required_matchers, required_notes = normalize_patterns(required_patterns)
     forbidden_matchers, forbidden_notes = normalize_patterns(forbidden_patterns)
-
     review_flag, review_reason, review_notes = title_based_review_flags(raw_rule)
 
     normalization_notes = []
@@ -777,13 +838,28 @@ def normalize_rule(raw_rule, document_name=""):
     normalization_notes.extend(forbidden_notes)
     normalization_notes.extend(review_notes)
 
+    # Important fix:
+    # Keep explicit required negated commands like "no cdp run" or
+    # "no clock summer-time" as REQUIRED commands.
+    # Do NOT rewrite them into forbids of the positive form.
+    if any(p.lower().startswith("no ") for p in required_patterns):
+        normalization_notes.append(
+            "Preserved explicit required negated command(s) as required matchers; no positive-form rewrite applied."
+        )
+
     extractor_review = bool(raw_rule.get("needs_human_review", False))
     no_det_logic = (len(required_matchers) == 0 and len(forbidden_matchers) == 0)
+    safe_family = is_safe_deterministic_family(raw_rule)
+    not_scorable_family = is_known_not_scorable_family(raw_rule)
 
-    if check_kind == "manual_review":
+    if not_scorable_family:
+        automation_status = "needs_human_review"
+        final_review_reason = "Benchmark text indicates this control is not safely scorable from running-config alone."
+        normalization_notes.append("Normalization kept this rule as review-only because it appears to be not scorable.")
+    elif check_kind == "manual_review" and not safe_family:
         automation_status = "needs_human_review"
         final_review_reason = "Extractor marked this as manual review."
-    elif extractor_review:
+    elif extractor_review and not safe_family:
         automation_status = "needs_human_review"
         final_review_reason = "Extractor marked this rule for human review."
     elif no_det_logic:
@@ -795,6 +871,10 @@ def normalize_rule(raw_rule, document_name=""):
     else:
         automation_status = "automated"
         final_review_reason = None
+        if extractor_review and safe_family:
+            normalization_notes.append("Overrode extractor human-review flag because this rule family is safe for deterministic evaluation.")
+        if check_kind == "manual_review" and safe_family:
+            normalization_notes.append("Overrode manual-review check kind because concrete patterns and a safe rule family were present.")
 
     normalized = {
         "rule_id": rule_id,
@@ -806,13 +886,17 @@ def normalize_rule(raw_rule, document_name=""):
         "scope": make_scope("unknown"),
         "check": {
             "kind": check_kind,
-            "required": required_matchers,
-            "forbidden": forbidden_matchers
+            # Legacy field for compatibility with existing checker code.
+            "required": list(required_matchers),
+            # Preferred field used by checks_ios.py when present.
+            "required_all": list(required_matchers),
+            "required_any": [],
+            "forbidden": list(forbidden_matchers),
         },
         "automation_status": automation_status,
         "review_reason": final_review_reason,
         "normalization_notes": unique_preserve(normalization_notes),
-        "raw_rule": raw_rule
+        "raw_rule": raw_rule,
     }
 
     variants = split_rule_by_scope(normalized, scopes)
@@ -822,16 +906,19 @@ def normalize_rule(raw_rule, document_name=""):
 
     return variants
 
-
 def semantic_rule_key(rule):
-    required = tuple(sorted(m.get("pattern", "") for m in rule.get("check", {}).get("required", [])))
+    required_all = tuple(sorted(m.get("pattern", "") for m in rule.get("check", {}).get("required_all", [])))
+    required_any = tuple(sorted(m.get("pattern", "") for m in rule.get("check", {}).get("required_any", [])))
     forbidden = tuple(sorted(m.get("pattern", "") for m in rule.get("check", {}).get("forbidden", [])))
+
     return (
-        rule.get("rule_id"),
+        canonical_rule_id(rule.get("rule_id", ""), title=rule.get("title", ""), source_section=rule.get("source", {}).get("section", "")),
+        clean_text(rule.get("title", "")).lower(),
         rule.get("vendor"),
         rule.get("scope", {}).get("scope_type"),
         rule.get("check", {}).get("kind"),
-        required,
+        required_all,
+        required_any,
         forbidden,
     )
 
@@ -865,6 +952,10 @@ def merge_duplicate_rules(rules, summary):
             existing["automation_status"] = rule.get("automation_status")
             existing["review_reason"] = rule.get("review_reason")
 
+        # Merge source excerpt when the existing one is empty.
+        if not clean_text(existing.get("source", {}).get("excerpt")) and clean_text(rule.get("source", {}).get("excerpt")):
+            existing["source"]["excerpt"] = rule["source"]["excerpt"]
+
     summary["warnings"] = unique_preserve(summary["warnings"])
     return merged
 
@@ -884,7 +975,7 @@ def normalize_rules(raw_doc):
                     output["normalization_summary"]["errors"].append({
                         "rule_index": idx,
                         "rule_id": nr.get("rule_id"),
-                        "errors": errors
+                        "errors": errors,
                     })
 
                 output["rules"].append(nr)
@@ -893,7 +984,7 @@ def normalize_rules(raw_doc):
             output["normalization_summary"]["errors"].append({
                 "rule_index": idx,
                 "rule_id": raw_rule.get("rule_id"),
-                "errors": [str(exc)]
+                "errors": [str(exc)],
             })
 
     output["rules"] = merge_duplicate_rules(output["rules"], output["normalization_summary"])
