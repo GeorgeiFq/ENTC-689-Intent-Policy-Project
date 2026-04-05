@@ -183,11 +183,16 @@ import requests
 from pypdf import PdfReader
 
 from normalize import normalize_rules
-from checks_ios import evaluate_all_rules, build_html_report
+from checks_ios import (
+    evaluate_all_rules,
+    build_ai_review_items,
+    merge_ai_review_suggestions,
+    build_html_report,
+)
 
 
 SUPPORTED_VENDOR = "Cisco IOS"
-DEFAULT_MODEL = "protected.gpt-4.1"
+DEFAULT_MODEL = "protected.gpt-5.2"
 RUNS_DIR = Path("runs")
 
 
@@ -508,7 +513,7 @@ def make_extraction_messages(document_name: str, chunk_text: str, chunk_index: i
         "Return ONLY valid JSON. Do not include markdown or commentary. "
         "Only include rules grounded in the provided text. Do not invent commands. "
         "This JSON will be normalized and then checked by deterministic Python logic; "
-        "the model is not the final compliance judge."
+        "the model is not the final compliance judge. Again RETURN ONLY VALID JSON"
     )
 
     user_prompt = f"""
@@ -600,6 +605,114 @@ def extract_rules_from_pdf_with_tamu(pdf_path: str, model: str = DEFAULT_MODEL):
 
 
 # ------------------------------------------------------------
+# AI second-pass review helpers
+# ------------------------------------------------------------
+def chunk_ai_review_items(items, max_items: int = 8, max_chars: int = 22000):
+    chunks = []
+    current = []
+    current_chars = 0
+
+    for item in items:
+        item_json = json.dumps(item, ensure_ascii=False)
+        item_len = len(item_json)
+
+        if current and (len(current) >= max_items or current_chars + item_len > max_chars):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+
+        current.append(item)
+        current_chars += item_len
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def make_second_pass_messages(review_items_chunk, chunk_index: int, total_chunks: int):
+    system_prompt = (
+        "You are the AI second-pass review layer for a Cisco IOS compliance assistant. "
+        "You are NOT the final compliance judge. The deterministic checker has already run. "
+        "You must review ONLY items that the deterministic pipeline left as NEEDS_HUMAN_REVIEW. "
+        "Return ONLY valid JSON. Do not include markdown or commentary. "
+        "Base your answer only on the provided rule/context/config evidence. "
+        "If the evidence is insufficient or ambiguous, return UNSURE instead of guessing."
+    )
+
+    user_prompt = f"""
+Review this batch of Cisco IOS compliance items that were left as NEEDS_HUMAN_REVIEW by the deterministic checker.
+
+Batch: {chunk_index} of {total_chunks}
+
+Return exactly this JSON shape:
+{{
+  "reviews": [
+    {{
+      "rule_id": "string",
+      "ai_suggested_status": "PASS|FAIL|UNSURE",
+      "confidence": "low|medium|high",
+      "explanation": "short grounded explanation",
+      "evidence_lines": ["Line 10: sample command", "header: line vty 0 4"]
+    }}
+  ]
+}}
+
+Rules for your response:
+- Do not omit any rule_id from the provided batch.
+- Do not invent config lines that are not present in the supplied context.
+- If the config appears to satisfy the benchmark intent, use PASS.
+- If the config appears to violate the benchmark intent or lacks a required setting, use FAIL.
+- If the context is not sufficient for a reliable judgment, use UNSURE.
+- Keep explanations short, concrete, and grounded in the provided benchmark excerpt and config context.
+- evidence_lines should be short strings copied or paraphrased from the supplied context only.
+
+Items to review:
+{json.dumps(review_items_chunk, indent=2)}
+""".strip()
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def run_ai_second_pass(review_items, model: str = DEFAULT_MODEL):
+    if not review_items:
+        return {"reviews": []}, []
+
+    chunks = chunk_ai_review_items(review_items)
+    all_reviews = []
+    raw_outputs = []
+
+    for idx, chunk in enumerate(chunks, start=1):
+        messages = make_second_pass_messages(chunk, idx, len(chunks))
+        content = call_tamu_chat(messages, model=model)
+        parsed = parse_json_from_model_text(content)
+        reviews = parsed.get("reviews", [])
+        if not isinstance(reviews, list):
+            raise ValueError(f"AI review chunk {idx} returned invalid JSON: 'reviews' must be a list.")
+
+        raw_outputs.append({
+            "chunk_index": idx,
+            "input_rule_ids": [item.get("rule_id") for item in chunk],
+            "model_output": parsed,
+        })
+        all_reviews.extend(reviews)
+
+    deduped = []
+    seen = set()
+    for review in all_reviews:
+        rule_id = str(review.get("rule_id") or "").strip()
+        if not rule_id or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        deduped.append(review)
+
+    return {"reviews": deduped}, raw_outputs
+
+
+# ------------------------------------------------------------
 # submit() is the UI's real orchestration callback.
 # ------------------------------------------------------------
 def submit(intent_pdf_path: str, config_txt_path: str, vendor: str, strictness: str):
@@ -631,8 +744,24 @@ def submit(intent_pdf_path: str, config_txt_path: str, vendor: str, strictness: 
         extracted_doc, chunk_outputs, pages, chunks = extract_rules_from_pdf_with_tamu(intent_pdf_path)
         config_text = read_text_file(config_txt_path)
         normalized_doc = normalize_rules(extracted_doc)
-        report = evaluate_all_rules(normalized_doc, config_text, strictness=strictness)
-        html_report = build_html_report(report, config_name=cfg_name)
+
+        deterministic_report = evaluate_all_rules(normalized_doc, config_text, strictness=strictness)
+        deterministic_html = build_html_report(deterministic_report, config_name=cfg_name)
+
+        review_items = build_ai_review_items(normalized_doc, deterministic_report, config_text)
+        ai_review_payload = {"reviews": []}
+        ai_review_outputs = []
+        ai_stage_error = None
+
+        if review_items:
+            try:
+                ai_review_payload, ai_review_outputs = run_ai_second_pass(review_items, model=DEFAULT_MODEL)
+            except Exception as ai_exc:
+                ai_stage_error = f"{type(ai_exc).__name__}: {ai_exc}"
+                ai_review_payload = {"reviews": [], "error": ai_stage_error}
+
+        final_report = merge_ai_review_suggestions(deterministic_report, ai_review_payload)
+        final_html = build_html_report(final_report, config_name=cfg_name)
 
         (run_dir / "policy_text.txt").write_text(
             "\n\n".join(
@@ -660,20 +789,37 @@ def submit(intent_pdf_path: str, config_txt_path: str, vendor: str, strictness: 
             json.dumps(normalized_doc, indent=2),
             encoding="utf-8",
         )
-        (run_dir / "check_results.json").write_text(
-            json.dumps(report, indent=2),
+        (run_dir / "deterministic_check_results.json").write_text(
+            json.dumps(deterministic_report, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "ai_review_inputs.json").write_text(
+            json.dumps({"review_items": review_items}, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "ai_review_outputs.json").write_text(
+            json.dumps({"payload": ai_review_payload, "chunk_outputs": ai_review_outputs}, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "final_check_results.json").write_text(
+            json.dumps(final_report, indent=2),
             encoding="utf-8",
         )
 
-        html_path = run_dir / "check_report.html"
-        html_path.write_text(html_report, encoding="utf-8")
+        deterministic_html_path = run_dir / "deterministic_check_report.html"
+        deterministic_html_path.write_text(deterministic_html, encoding="utf-8")
+
+        final_html_path = run_dir / "final_check_report.html"
+        final_html_path.write_text(final_html, encoding="utf-8")
 
         try:
-            webbrowser.open(html_path.resolve().as_uri())
+            webbrowser.open(final_html_path.resolve().as_uri())
         except Exception:
             pass
 
         norm_summary = normalized_doc.get("normalization_summary", {})
+        ai_info = final_report.get("ai_second_pass", {})
+
         md = f"""
 ### ✅ Compliance run complete
 
@@ -691,16 +837,30 @@ def submit(intent_pdf_path: str, config_txt_path: str, vendor: str, strictness: 
 - **Auto-evaluable rules:** `{norm_summary.get('automated_rule_count', 0)}`
 - **Normalization review-only rules:** `{norm_summary.get('needs_human_review_count', 0)}`
 
-### Check results
-- **PASS:** `{report['pass_count']}`
-- **FAIL:** `{report['fail_count']}`
-- **NEEDS HUMAN REVIEW:** `{report['needs_human_review_count']}`
-- **Total rules:** `{report['total_rules']}`
+### Deterministic first pass
+- **PASS:** `{deterministic_report['pass_count']}`
+- **FAIL:** `{deterministic_report['fail_count']}`
+- **NEEDS HUMAN REVIEW:** `{deterministic_report['needs_human_review_count']}`
+- **Total rules:** `{deterministic_report['total_rules']}`
 
-The downloadable artifact is the generated HTML report.
+### AI second pass on review-only items
+- **Review items sent to AI:** `{ai_info.get('reviewed_rule_count', 0)}`
+- **AI suggested PASS:** `{ai_info.get('ai_suggested_pass_count', 0)}`
+- **AI suggested FAIL:** `{ai_info.get('ai_suggested_fail_count', 0)}`
+- **AI remained UNSURE:** `{ai_info.get('ai_unsure_count', 0)}`
+
+### Final report counts
+- **PASS:** `{ai_info.get('final_pass_count', deterministic_report['pass_count'])}`
+- **FAIL:** `{ai_info.get('final_fail_count', deterministic_report['fail_count'])}`
+- **NEEDS HUMAN REVIEW:** `{ai_info.get('final_needs_human_review_count', deterministic_report['needs_human_review_count'])}`
+
+The downloadable artifact is the **final HTML report**. It clearly separates deterministic decisions from AI-suggested review results and notes that human review may still be necessary.
 """.strip()
 
-        return md, gr.update(visible=True, value=str(html_path))
+        if ai_stage_error:
+            md += f"\n\n**Note:** The AI second-pass stage encountered an error and no AI suggestions were applied: `{ai_stage_error}`"
+
+        return md, gr.update(visible=True, value=str(final_html_path))
 
     except Exception as exc:
         fail_dir = None
@@ -1252,4 +1412,5 @@ with gr.Blocks(title="Policy Intent Compliance Assistant", theme=theme, css=css)
 if __name__ == "__main__":
     RUNS_DIR.mkdir(exist_ok=True)
     demo.queue()
+    demo.launch()
     demo.launch(inbrowser=True)
